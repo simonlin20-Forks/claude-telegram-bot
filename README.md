@@ -31,6 +31,7 @@ To achieve this, I set up a folder with a CLAUDE.md that teaches Claude about me
 - 📨 **Message queuing**: Send multiple messages while Claude works - they queue up automatically. Prefix with `!` or use `/stop` to interrupt and send immediately
 - 🧠 **Extended thinking**: Trigger Claude's reasoning by using words like "think" or "reason" - you'll see its thought process as it works (configurable via `THINKING_TRIGGER_KEYWORDS`)
 - 🔘 **Interactive buttons**: Claude can present options as tappable inline buttons via the built-in `ask_user` MCP tool
+- 🤖 **Model switching**: Switch AI models on-the-fly via `/model` — choose between Opus, Sonnet, and Haiku
 
 ## Quick Start
 
@@ -88,6 +89,11 @@ resume - Pick from recent sessions to resume
 stop - Interrupt current query
 status - Check what Claude is doing
 restart - Restart the bot
+model - Switch AI model
+context - Show model and context info
+token - Show token usage stats
+usage - Show quota usage
+retry - Retry last message
 ```
 
 ### 2. Configure Environment
@@ -102,6 +108,7 @@ TELEGRAM_ALLOWED_USERS=123456789           # Your Telegram user ID
 # Recommended
 CLAUDE_WORKING_DIR=/path/to/your/folder    # Where Claude runs (loads CLAUDE.md, skills, MCP)
 OPENAI_API_KEY=sk-...                      # For voice transcription
+# CLAUDE_MODEL=claude-sonnet-4-5           # Default model (changeable at runtime via /model)
 ```
 
 **Finding your Telegram user ID:** Message [@userinfobot](https://t.me/userinfobot) on Telegram.
@@ -131,14 +138,45 @@ The bot includes a built-in `ask_user` MCP server that lets Claude present optio
 
 ## Bot Commands
 
-| Command    | Description                       |
-| ---------- | --------------------------------- |
-| `/start`   | Show status and your user ID      |
-| `/new`     | Start a fresh session             |
-| `/resume`  | Pick from last 5 sessions to resume (with recap) |
-| `/stop`    | Interrupt current query           |
-| `/status`  | Check what Claude is doing        |
-| `/restart` | Restart the bot                   |
+| Command      | Description                                          |
+| ------------ | ---------------------------------------------------- |
+| `/start`     | Show status and your user ID                         |
+| `/new`       | Start a fresh session                                |
+| `/resume`    | Pick from last 5 sessions to resume (with recap)     |
+| `/stop`      | Interrupt current query                              |
+| `/status`    | Check what Claude is doing                           |
+| `/restart`   | Restart the bot                                      |
+| `/model`     | Switch AI model (inline buttons or `/model <name>`)  |
+| `/context`   | Show current model, context window & session info    |
+| `/token`     | Show token usage stats for current session           |
+| `/usage`     | Show Claude quota usage with progress bar            |
+| `/retry`     | Retry the last message                               |
+
+## Model Switching
+
+Switch between Claude models at any time without restarting the bot:
+
+```
+/model                      → Show current model + select via inline buttons
+/model claude-opus-4-5      → Switch directly by name
+/model claude-haiku-4-5     → Switch to fastest model
+```
+
+**Available models:**
+
+| Model                 | Best For                                  |
+| --------------------- | ----------------------------------------- |
+| `claude-sonnet-4-5`   | Balanced speed & quality **(default)**    |
+| `claude-opus-4-5`     | Most capable, best for complex reasoning  |
+| `claude-haiku-4-5`    | Fastest responses, lightweight tasks      |
+
+Set a persistent default in `.env`:
+
+```bash
+CLAUDE_MODEL=claude-opus-4-5
+```
+
+The model switches immediately for the **next query**. Your session history is preserved.
 
 ## Running as a Service (macOS)
 
