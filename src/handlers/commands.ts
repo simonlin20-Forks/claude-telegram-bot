@@ -506,7 +506,62 @@ export async function handleContext(ctx: Context): Promise<void> {
     lines.push("\n<b>Session:</b> None");
   }
 
-  lines.push("\n<i>Context % shown in statusLine (CLI only)</i>");
+  // Calculate context % from session jsonl file
+  try {
+    const currentSessionId = session.sessionId ?? "";
+    const proc = Bun.spawn(["python3", "-c", `
+import json, glob, os
+home = os.path.expanduser('~')
+cwd = '${process.env.HOME}/repository'
+project_key = cwd.replace('/', '-')
+project_dir = f'{home}/.claude/projects/{project_key}'
+session_id = '${currentSessionId}'
+
+# Try to find the exact file for current session first
+target_file = None
+if session_id:
+    exact = os.path.join(project_dir, f'{session_id}.jsonl')
+    if os.path.exists(exact):
+        target_file = exact
+
+# Fallback: latest non-agent file
+if not target_file:
+    files = sorted(glob.glob(f'{project_dir}/*.jsonl'), key=os.path.getmtime, reverse=True)
+    files = [f for f in files if not os.path.basename(f).startswith('agent-')]
+    if files:
+        target_file = files[0]
+
+if not target_file:
+    print('no_session')
+else:
+    for line in reversed(open(target_file).readlines()):
+        try:
+            d = json.loads(line.strip())
+            u = d.get('message', {}).get('usage', {})
+            if u and ('input_tokens' in u or 'cache_read_input_tokens' in u):
+                used = (u.get('input_tokens', 0)
+                      + u.get('cache_read_input_tokens', 0)
+                      + u.get('cache_creation_input_tokens', 0))
+                ctx_window = 200000
+                remaining_pct = (ctx_window - used) / ctx_window * 100
+                print(f'{remaining_pct:.1f}|{used}|{ctx_window}')
+                break
+        except:
+            pass
+`], { stdout: "pipe", stderr: "pipe" });
+    const output = await new Response(proc.stdout).text();
+    const trimmed = output.trim();
+    if (trimmed && trimmed !== "no_session") {
+      const [pct, used, total] = trimmed.split("|");
+      const usedK = Math.round(Number(used) / 1000);
+      const totalK = Math.round(Number(total) / 1000);
+      lines.push(`\n📊 <b>Context:</b> ${pct}% remaining (~${usedK}k / ${totalK}k tokens used)`);
+    } else {
+      lines.push("\n📊 <b>Context:</b> 無法取得");
+    }
+  } catch {
+    lines.push("\n<i>Context % shown in statusLine (CLI only)</i>");
+  }
 
   await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
 }
