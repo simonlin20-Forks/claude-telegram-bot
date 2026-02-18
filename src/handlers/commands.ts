@@ -6,7 +6,7 @@
 
 import type { Context } from "grammy";
 import { session } from "../session";
-import { WORKING_DIR, ALLOWED_USERS, RESTART_FILE } from "../config";
+import { WORKING_DIR, ALLOWED_USERS, RESTART_FILE, AVAILABLE_MODELS, DEFAULT_MODEL } from "../config";
 import { isAuthorized } from "../security";
 
 /**
@@ -32,9 +32,13 @@ export async function handleStart(ctx: Context): Promise<void> {
       `/new - Start fresh session\n` +
       `/stop - Stop current query\n` +
       `/status - Show detailed status\n` +
+      `/context - Show model &amp; context info\n` +
+      `/token - Show token usage stats\n` +
+      `/usage - Show quota usage\n` +
       `/resume - Resume last session\n` +
       `/retry - Retry last message\n` +
-      `/restart - Restart the bot\n\n` +
+      `/restart - Restart the bot\n` +
+      `/model - Switch AI model\n\n` +
       `<b>Tips:</b>\n` +
       `• Prefix with <code>!</code> to interrupt current query\n` +
       `• Use "think" keyword for extended reasoning\n` +
@@ -257,6 +261,283 @@ export async function handleRestart(ctx: Context): Promise<void> {
 
   // Exit - launchd will restart us
   process.exit(0);
+}
+
+/**
+ * /model - Show current model or switch to a different one.
+ * Usage:
+ *   /model          → show current model + available options (inline buttons)
+ *   /model <name>   → switch to specified model
+ */
+export async function handleModel(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized.");
+    return;
+  }
+
+  const args = ctx.message?.text?.split(/\s+/).slice(1) ?? [];
+  const requestedModel = args[0]?.trim();
+
+  // If a model name was provided, switch to it
+  if (requestedModel) {
+    const [success, message] = session.setModel(requestedModel);
+    if (success) {
+      await ctx.reply(`✅ ${message}\n\n💡 New model will be used for <b>next query</b>.`, { parse_mode: "HTML" });
+    } else {
+      await ctx.reply(`❌ ${message}`, { parse_mode: "HTML" });
+    }
+    return;
+  }
+
+  // Otherwise show current model and inline buttons to switch
+  const currentModel = session.currentModel;
+  const defaultLabel = DEFAULT_MODEL === currentModel ? " (default)" : "";
+
+  const buttons = AVAILABLE_MODELS.map((m) => {
+    const isActive = m === currentModel;
+    return [
+      {
+        text: isActive ? `✅ ${m}` : m,
+        callback_data: `model:${m}`,
+      },
+    ];
+  });
+
+  await ctx.reply(
+    `🤖 <b>Model Selection</b>\n\n` +
+      `Current: <code>${currentModel}</code>${defaultLabel}\n` +
+      `Default (.env): <code>${DEFAULT_MODEL}</code>\n\n` +
+      `Select a model or use <code>/model &lt;name&gt;</code>:`,
+    {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: buttons },
+    }
+  );
+}
+
+/**
+ * /usage - Show cumulative token usage for the current session.
+ */
+export async function handleUsage(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized.");
+    return;
+  }
+
+  // ── Helper: progress bar ──────────────────────────────────────────────
+  function buildProgressBar(pct: number, width = 28): string {
+    const filled = Math.round((Math.min(100, Math.max(0, pct)) / 100) * width);
+    return "█".repeat(filled) + "░".repeat(width - filled);
+  }
+
+  // ── Helper: format resets_at timestamp ───────────────────────────────
+  function formatResetTime(iso: string): string {
+    const d = new Date(iso);
+    const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    const now = new Date();
+    const h = d.getUTCHours();
+    const ampm = h === 0 ? "12am" : h < 12 ? `${h}am` : h === 12 ? "12pm" : `${h - 12}pm`;
+    // Same calendar day?
+    if (d.getUTCFullYear() === now.getUTCFullYear() &&
+        d.getUTCMonth()    === now.getUTCMonth()    &&
+        d.getUTCDate()     === now.getUTCDate()) {
+      return `${ampm} (UTC)`;
+    }
+    return `${months[d.getUTCMonth()]} ${d.getUTCDate()}, ${ampm} (UTC)`;
+  }
+
+  // ── Fetch real Pro/Max plan quota from Anthropic OAuth API ────────────
+  interface UsageLimit { utilization: number | null; resets_at: string | null }
+  interface ExtraUsage { is_enabled: boolean; monthly_limit: number | null; used_credits: number | null; utilization: number | null }
+  interface UsageData {
+    five_hour?:       UsageLimit | null;
+    seven_day?:       UsageLimit | null;
+    seven_day_sonnet?: UsageLimit | null;
+    extra_usage?:     ExtraUsage | null;
+  }
+
+  let usageData: UsageData | null = null;
+  let fetchError = "";
+
+  try {
+    // Read OAuth credentials written by Claude Code
+    const credsPath = `${process.env.HOME}/.claude/.credentials.json`;
+    const credsRaw = await Bun.file(credsPath).text();
+    const creds = JSON.parse(credsRaw);
+    const token: string = creds?.claudeAiOauth?.accessToken ?? "";
+
+    if (!token) throw new Error("No OAuth token found");
+
+    const resp = await fetch("https://api.anthropic.com/api/oauth/usage", {
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "anthropic-beta": "oauth-2025-04-20",
+      },
+      signal: AbortSignal.timeout(6000),
+    });
+
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    usageData = await resp.json() as UsageData;
+  } catch (err) {
+    fetchError = err instanceof Error ? err.message : String(err);
+  }
+
+  // ── Build output ──────────────────────────────────────────────────────
+  const lines: string[] = [];
+  lines.push("<b>Usage</b>  (← /usage)");
+  lines.push(`<i>Settings:  Status   Config   <b>Usage</b></i>`);
+  lines.push("");
+
+  if (fetchError || !usageData) {
+    lines.push(`⚠️ Could not load quota data`);
+    lines.push(`<code>${fetchError || "Unknown error"}</code>`);
+  } else {
+    // ── Section renderer ─────────────────────────────────────────────
+    function renderSection(title: string, limit: UsageLimit | null | undefined, extraSubtext?: string) {
+      if (!limit || limit.utilization === null) return;
+      const pct = Math.floor(limit.utilization);
+      const bar = buildProgressBar(pct);
+      const resetStr = limit.resets_at ? `Resets ${formatResetTime(limit.resets_at)}` : "";
+      const subtext = [extraSubtext, resetStr].filter(Boolean).join("  ·  ");
+      lines.push(`<b>${title}</b>`);
+      lines.push(`<code>${bar}</code>`);
+      lines.push(`${pct}% used`);
+      if (subtext) lines.push(`<i>${subtext}</i>`);
+      lines.push("");
+    }
+
+    renderSection("Current session", usageData.five_hour);
+    renderSection("Current week (all models)", usageData.seven_day);
+    if (usageData.seven_day_sonnet?.utilization !== null && usageData.seven_day_sonnet) {
+      renderSection("Current week (Sonnet only)", usageData.seven_day_sonnet);
+    }
+
+    // ── Extra usage ────────────────────────────────────────────────
+    const ex = usageData.extra_usage;
+    if (ex) {
+      if (!ex.is_enabled) {
+        lines.push("<b>Extra usage</b>");
+        lines.push("Not enabled");
+        lines.push("");
+      } else if (ex.monthly_limit === null) {
+        lines.push("<b>Extra usage</b>");
+        lines.push("Unlimited");
+        lines.push("");
+      } else if (ex.utilization !== null && ex.used_credits !== null && ex.monthly_limit !== null) {
+        const used  = (ex.used_credits  / 100).toFixed(2);
+        const limit = (ex.monthly_limit / 100).toFixed(2);
+        // Reset on 1st of next month
+        const now = new Date();
+        const nextMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+        renderSection("Extra usage", { utilization: ex.utilization, resets_at: nextMonth.toISOString() }, `$${used} / $${limit} spent`);
+      }
+    }
+  }
+
+  await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+}
+
+/**
+ * /context - Show current model and context window usage.
+ */
+export async function handleContext(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized.");
+    return;
+  }
+
+  const model = session.currentModel;
+
+  // Read settings.json to get effortLevel
+  let effortLevel = "";
+  try {
+    const settingsPath = `${process.env.HOME}/.claude/settings.json`;
+    const raw = await Bun.file(settingsPath).text();
+    const settings = JSON.parse(raw);
+    effortLevel = settings.effortLevel ?? "";
+  } catch {
+    // ignore
+  }
+
+  // Session info
+  const lines: string[] = [];
+  lines.push("🤖 <b>Context &amp; Model</b>\n");
+  lines.push(`<b>Model:</b> <code>${model}</code>`);
+  if (effortLevel) lines.push(`<b>Effort:</b> <code>${effortLevel}</code>`);
+
+  // Session context info
+  if (session.isActive) {
+    const elapsed = Math.floor((Date.now() - session.sessionStartTime.getTime()) / 1000);
+    const mins = Math.floor(elapsed / 60);
+    const secs = elapsed % 60;
+    const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+    lines.push(`\n<b>Session:</b> Active (${session.sessionId?.slice(0, 8)}...)`);
+    lines.push(`<b>Duration:</b> ${timeStr}`);
+    lines.push(`<b>Queries:</b> ${session.totalQueries}`);
+  } else {
+    lines.push("\n<b>Session:</b> None");
+  }
+
+  lines.push("\n<i>Context % shown in statusLine (CLI only)</i>");
+
+  await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+}
+
+/**
+ * /token - Show cumulative token usage for current session.
+ */
+export async function handleToken(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+
+  if (!isAuthorized(userId, ALLOWED_USERS)) {
+    await ctx.reply("Unauthorized.");
+    return;
+  }
+
+  const lines: string[] = [];
+  lines.push("📊 <b>Token Usage</b>\n");
+
+  // Session duration
+  const elapsed = Math.floor((Date.now() - session.sessionStartTime.getTime()) / 1000);
+  const hours = Math.floor(elapsed / 3600);
+  const mins = Math.floor((elapsed % 3600) / 60);
+  const secs = elapsed % 60;
+  const timeStr = hours > 0
+    ? `${hours}h ${mins}m ${secs}s`
+    : mins > 0
+    ? `${mins}m ${secs}s`
+    : `${secs}s`;
+
+  lines.push(`🕐 <b>Session duration:</b> ${timeStr}`);
+  lines.push(`📨 <b>Total queries:</b> ${session.totalQueries}`);
+
+  // Cumulative tokens
+  lines.push(`\n<b>📈 Cumulative tokens:</b>`);
+  lines.push(`   Input:        ${session.totalInputTokens.toLocaleString()}`);
+  lines.push(`   Output:       ${session.totalOutputTokens.toLocaleString()}`);
+  lines.push(`   Cache read:   ${session.totalCacheReadTokens.toLocaleString()}`);
+  lines.push(`   Cache write:  ${session.totalCacheCreationTokens.toLocaleString()}`);
+
+  // Last query
+  if (session.lastUsage) {
+    const u = session.lastUsage;
+    lines.push(`\n<b>🔍 Last query:</b>`);
+    if (u.input_tokens)              lines.push(`   Input:  ${u.input_tokens.toLocaleString()}`);
+    if (u.output_tokens)             lines.push(`   Output: ${u.output_tokens.toLocaleString()}`);
+    if (u.cache_read_input_tokens)   lines.push(`   Cache read: ${u.cache_read_input_tokens.toLocaleString()}`);
+    if (u.cache_creation_input_tokens) lines.push(`   Cache write: ${u.cache_creation_input_tokens.toLocaleString()}`);
+  } else {
+    lines.push("\n<i>No queries yet in this session</i>");
+  }
+
+  await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
 }
 
 /**

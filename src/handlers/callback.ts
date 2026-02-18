@@ -7,7 +7,7 @@
 import type { Context } from "grammy";
 import { unlinkSync } from "fs";
 import { session } from "../session";
-import { ALLOWED_USERS } from "../config";
+import { ALLOWED_USERS, AVAILABLE_MODELS, DEFAULT_MODEL } from "../config";
 import { isAuthorized } from "../security";
 import { auditLog, startTypingIndicator } from "../utils";
 import { StreamingState, createStatusCallback } from "./streaming";
@@ -35,6 +35,12 @@ export async function handleCallback(ctx: Context): Promise<void> {
   // 2. Handle resume callbacks: resume:{session_id}
   if (callbackData.startsWith("resume:")) {
     await handleResumeCallback(ctx, callbackData);
+    return;
+  }
+
+  // 2b. Handle model switch callbacks: model:{model_name}
+  if (callbackData.startsWith("model:")) {
+    await handleModelCallback(ctx, callbackData);
     return;
   }
 
@@ -150,6 +156,53 @@ export async function handleCallback(ctx: Context): Promise<void> {
   } finally {
     typing.stop();
   }
+}
+
+/**
+ * Handle model switch callback (model:{model_name}).
+ */
+async function handleModelCallback(
+  ctx: Context,
+  callbackData: string
+): Promise<void> {
+  const modelName = callbackData.replace("model:", "");
+
+  const [success, message] = session.setModel(modelName);
+
+  if (!success) {
+    await ctx.answerCallbackQuery({ text: message, show_alert: true });
+    return;
+  }
+
+  // Update the inline keyboard message to reflect new active model
+  const currentModel = session.currentModel;
+  const buttons = AVAILABLE_MODELS.map((m) => {
+    const isActive = m === currentModel;
+    return [
+      {
+        text: isActive ? `✅ ${m}` : m,
+        callback_data: `model:${m}`,
+      },
+    ];
+  });
+
+  try {
+    await ctx.editMessageText(
+      `🤖 <b>Model Selection</b>\n\n` +
+        `Current: <code>${currentModel}</code>\n` +
+        `Default (.env): <code>${DEFAULT_MODEL}</code>\n\n` +
+        `Select a model or use <code>/model &lt;name&gt;</code>:\n\n` +
+        `💡 New model applies to <b>next query</b>.`,
+      {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: buttons },
+      }
+    );
+  } catch (error) {
+    console.debug("Failed to edit model message:", error);
+  }
+
+  await ctx.answerCallbackQuery({ text: `✅ Switched to ${modelName}` });
 }
 
 /**

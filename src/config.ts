@@ -45,6 +45,21 @@ export const ALLOWED_USERS: number[] = (
 export const WORKING_DIR = process.env.CLAUDE_WORKING_DIR || HOME;
 export const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
+// Available Claude models
+export const AVAILABLE_MODELS = [
+  "claude-opus-4-6",
+  "claude-sonnet-4-6",
+  "claude-haiku-4-5",
+] as const;
+
+export type ClaudeModel = typeof AVAILABLE_MODELS[number];
+
+// Default model from .env, fallback to sonnet-4-6
+const envModel = process.env.CLAUDE_MODEL || "claude-sonnet-4-6";
+export const DEFAULT_MODEL: ClaudeModel = AVAILABLE_MODELS.includes(envModel as ClaudeModel)
+  ? (envModel as ClaudeModel)
+  : "claude-sonnet-4-6";
+
 // ============== Claude CLI Path ==============
 
 // Auto-detect from PATH, or use environment override

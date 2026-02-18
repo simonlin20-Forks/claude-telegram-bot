@@ -14,6 +14,8 @@ import { readFileSync } from "fs";
 import type { Context } from "grammy";
 import {
   ALLOWED_PATHS,
+  AVAILABLE_MODELS,
+  DEFAULT_MODEL,
   MCP_SERVERS,
   SAFETY_PROMPT,
   SESSION_FILE,
@@ -22,6 +24,7 @@ import {
   THINKING_DEEP_KEYWORDS,
   THINKING_KEYWORDS,
   WORKING_DIR,
+  type ClaudeModel,
 } from "./config";
 import { formatToolStatus } from "./formatting";
 import { checkPendingAskUserRequests } from "./handlers/streaming";
@@ -85,6 +88,27 @@ class ClaudeSession {
   lastUsage: TokenUsage | null = null;
   lastMessage: string | null = null;
   conversationTitle: string | null = null;
+  currentModel: ClaudeModel = DEFAULT_MODEL;
+
+  // Cumulative token usage across all queries in this session
+  totalInputTokens = 0;
+  totalOutputTokens = 0;
+  totalCacheReadTokens = 0;
+  totalCacheCreationTokens = 0;
+  totalQueries = 0;
+  sessionStartTime: Date = new Date();
+
+  /**
+   * Set the model to use for the next query.
+   * Returns [success, message].
+   */
+  setModel(model: string): [boolean, string] {
+    if (!AVAILABLE_MODELS.includes(model as ClaudeModel)) {
+      return [false, `Unknown model: ${model}\nAvailable: ${AVAILABLE_MODELS.join(", ")}`];
+    }
+    this.currentModel = model as ClaudeModel;
+    return [true, `Model set to: ${model}`];
+  }
 
   private abortController: AbortController | null = null;
   private isQueryRunning = false;
@@ -207,7 +231,7 @@ class ClaudeSession {
 
     // Build SDK V1 options - supports all features
     const options: Options = {
-      model: "claude-sonnet-4-5",
+      model: this.currentModel,
       cwd: WORKING_DIR,
       settingSources: ["user", "project"],
       permissionMode: "bypassPermissions",
@@ -229,10 +253,10 @@ class ClaudeSession {
         `RESUMING session ${this.sessionId.slice(
           0,
           8
-        )}... (thinking=${thinkingLabel})`
+        )}... (model=${this.currentModel}, thinking=${thinkingLabel})`
       );
     } else {
-      console.log(`STARTING new Claude session (thinking=${thinkingLabel})`);
+      console.log(`STARTING new Claude session (model=${this.currentModel}, thinking=${thinkingLabel})`);
       this.sessionId = null;
     }
 
@@ -413,6 +437,12 @@ class ClaudeSession {
           if ("usage" in event && event.usage) {
             this.lastUsage = event.usage as TokenUsage;
             const u = this.lastUsage;
+            // Accumulate totals
+            this.totalInputTokens += u.input_tokens || 0;
+            this.totalOutputTokens += u.output_tokens || 0;
+            this.totalCacheReadTokens += u.cache_read_input_tokens || 0;
+            this.totalCacheCreationTokens += u.cache_creation_input_tokens || 0;
+            this.totalQueries++;
             console.log(
               `Usage: in=${u.input_tokens} out=${u.output_tokens} cache_read=${
                 u.cache_read_input_tokens || 0
@@ -473,6 +503,13 @@ class ClaudeSession {
     this.sessionId = null;
     this.lastActivity = null;
     this.conversationTitle = null;
+    // Reset cumulative usage on new session
+    this.totalInputTokens = 0;
+    this.totalOutputTokens = 0;
+    this.totalCacheReadTokens = 0;
+    this.totalCacheCreationTokens = 0;
+    this.totalQueries = 0;
+    this.sessionStartTime = new Date();
     console.log("Session cleared");
   }
 
