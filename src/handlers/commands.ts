@@ -363,16 +363,19 @@ export async function handleUsage(ctx: Context): Promise<void> {
   let usageData: UsageData | null = null;
   let fetchError = "";
 
-  try {
-    // Read OAuth credentials written by Claude Code
+  // Helper: read access token from credentials file
+  async function readAccessToken(): Promise<string> {
     const credsPath = `${process.env.HOME}/.claude/.credentials.json`;
     const credsRaw = await Bun.file(credsPath).text();
     const creds = JSON.parse(credsRaw);
     const token: string = creds?.claudeAiOauth?.accessToken ?? "";
-
     if (!token) throw new Error("No OAuth token found");
+    return token;
+  }
 
-    const resp = await fetch("https://api.anthropic.com/api/oauth/usage", {
+  // Helper: fetch usage with a given token
+  async function fetchUsage(token: string): Promise<Response> {
+    return fetch("https://api.anthropic.com/api/oauth/usage", {
       headers: {
         "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json",
@@ -380,6 +383,24 @@ export async function handleUsage(ctx: Context): Promise<void> {
       },
       signal: AbortSignal.timeout(6000),
     });
+  }
+
+  try {
+    let token = await readAccessToken();
+    let resp = await fetchUsage(token);
+
+    // If 401, try to refresh token by invoking claude CLI, then retry once
+    if (resp.status === 401) {
+      try {
+        const proc = Bun.spawn(["claude", "--version"], { stderr: "ignore", stdout: "ignore" });
+        await proc.exited;
+      } catch {
+        // ignore errors from claude CLI - it may still have refreshed the token
+      }
+      // Re-read credentials after potential refresh
+      token = await readAccessToken();
+      resp = await fetchUsage(token);
+    }
 
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     usageData = await resp.json() as UsageData;
